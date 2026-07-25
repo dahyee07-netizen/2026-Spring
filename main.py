@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date
@@ -6,7 +6,7 @@ from enum import Enum
 
 app = FastAPI(
     title="F&B 소상공인 정부정책 지원금 및 적격성 API",
-    description="LLM 에이전트 및 결정형 시스템이 호출하여 정책 데이터를 조회하고, 선언적 규칙 기반 적격성 판정 및 지원 효과를 시뮬레이션하는 API",
+    description="LLM 에이전트 및 결정형 시스템이 호출하여 정책 데이터를 조회하고, 선언적 규칙 기반 적격성 판정, 지원 효과 시뮬레이션 및 원문 출처(Evidence)를 검증하는 API",
     version="2.0.0"
 )
 
@@ -36,7 +36,7 @@ class PolicySupport(BaseModel):
     max_amount_krw: int = Field(..., description="최대 지원 한도(원)", example=50000000)
     application_start: date = Field(..., description="신청 시작일", example="2026-01-01")
     application_end: date = Field(..., description="신청 마감일", example="2026-12-31")
-    source_id: str = Field(..., description="원문 출처 식별자", example="SRC-POLICY-2026-01")
+    source_id: str = Field(..., description="원문 출처 식별자", example="SRC-SEMAS-2026-01")
     validation_status: str = Field(default="ACCEPTED", description="검증 상태 (ACCEPTED, EXTRACTED 등)")
 
 class StoreProfileRequest(BaseModel):
@@ -51,7 +51,6 @@ class EligibilityResult(BaseModel):
     status: EligibilityStatus
     reasons: List[str] = Field(..., description="판정 사유 상세 목록")
 
-# [명세서 18.4] 지원 효과 시뮬레이션 요청/응답 스키마
 class SimulationRequest(BaseModel):
     policy_id: str = Field(..., description="적용하고자 하는 정책 ID", example="POL-2026-001")
     current_loan_amount_krw: int = Field(..., description="기존 대출 잔액(원)", example=30000000)
@@ -66,7 +65,15 @@ class SimulationResult(BaseModel):
     monthly_savings_krw: int = Field(..., description="월 절감액(원)")
     summary_message: str = Field(..., description="결과 요약 설명 문구")
 
-# --- 3. Mock 정책 데이터 ---
+# [명세서 18.2] LLM 팩트체크용 출처 근거 스키마
+class PolicyEvidenceResponse(BaseModel):
+    policy_id: str
+    source_id: str
+    source_url: str = Field(..., description="원문 공고문 URL")
+    evidence_text: str = Field(..., description="AI 답변 생성 시 필수 인용할 원문 규정 문구")
+    extracted_at: str = Field(..., description="데이터 수집 시점")
+
+# --- 3. Mock 정책 및 근거 데이터 ---
 
 MOCK_POLICIES: List[dict] = [
     {
@@ -98,6 +105,21 @@ MOCK_POLICIES: List[dict] = [
         "validation_status": "ACCEPTED"
     }
 ]
+
+MOCK_EVIDENCES = {
+    "POL-2026-001": {
+        "source_id": "SRC-SEMAS-2026-01",
+        "source_url": "https://www.semas.or.kr/announcements/2026-001",
+        "evidence_text": "제3조(지원대상): 전국 F&B 음식점 및 카페를 운영하는 소상공인 중 고금리 대출을 보유한 자. 최대 한도 5,000만원 내에서 연 2.0% 대환 금리를 적용함.",
+        "extracted_at": "2026-01-02T09:00:00Z"
+    },
+    "POL-2026-002": {
+        "source_id": "SRC-SEOUL-2026-05",
+        "source_url": "https://www.seoul.go.kr/news/news_notice.do#2026-05",
+        "evidence_text": "서울특별시 공고 제2026-05호: 사업장 소재지가 서울특별시(지역코드 11)인 영세 소상공인을 대상으로 사업장 임대료를 최대 200만원 한도로 지원함. 유흥 및 사행성 업종 제외.",
+        "extracted_at": "2026-02-01T10:00:00Z"
+    }
+}
 
 # --- 4. 엔드포인트 구현 ---
 
@@ -163,9 +185,6 @@ def evaluate_policy_eligibility(store: StoreProfileRequest):
 
 @app.post("/api/v1/policies/simulate-benefit", response_model=SimulationResult)
 def simulate_policy_benefit(req: SimulationRequest):
-    """
-    [명세서 18.4] 정책 적용 시 기존 대출 대비 금융비용 절감액을 수치적으로 시뮬레이션합니다.
-    """
     current_annual_interest = int(req.current_loan_amount_krw * (req.current_interest_rate_pct / 100))
     new_annual_interest = int(req.current_loan_amount_krw * (req.policy_interest_rate_pct / 100))
     annual_savings = current_annual_interest - new_annual_interest
@@ -178,4 +197,21 @@ def simulate_policy_benefit(req: SimulationRequest):
         annual_savings_krw=annual_savings,
         monthly_savings_krw=monthly_savings,
         summary_message=f"정책 적용 시 연간 약 {annual_savings:,}원(월 약 {monthly_savings:,}원)의 이자 비용이 절감됩니다."
+    )
+
+@app.get("/api/v1/policies/{policy_id}/evidence", response_model=PolicyEvidenceResponse)
+def get_policy_evidence(policy_id: str):
+    """
+    [명세서 18.2] LLM 에이전트가 답변 근거로 활용할 정책의 원문 출처 및 인용 문구를 반환합니다.
+    """
+    if policy_id not in MOCK_EVIDENCES:
+        raise HTTPException(status_code=404, detail="해당 정책의 근거 데이터를 찾을 수 없습니다.")
+    
+    evidence = MOCK_EVIDENCES[policy_id]
+    return PolicyEvidenceResponse(
+        policy_id=policy_id,
+        source_id=evidence["source_id"],
+        source_url=evidence["source_url"],
+        evidence_text=evidence["evidence_text"],
+        extracted_at=evidence["extracted_at"]
     )
