@@ -6,7 +6,7 @@ from enum import Enum
 
 app = FastAPI(
     title="F&B 소상공인 정부정책 지원금 및 적격성 API",
-    description="LLM 에이전트 및 결정형 시스템이 호출하여 정책 데이터를 조회하고, 선언적 규칙 기반 적격성을 판정하는 API",
+    description="LLM 에이전트 및 결정형 시스템이 호출하여 정책 데이터를 조회하고, 선언적 규칙 기반 적격성 판정 및 지원 효과를 시뮬레이션하는 API",
     version="2.0.0"
 )
 
@@ -23,7 +23,7 @@ class EligibilityStatus(str, Enum):
     INELIGIBLE = "INELIGIBLE"                # 부적격
     CLOSED = "CLOSED"                        # 신청 마감
 
-# --- 2. 데이터 스키마 정의 (명세서 18.2) ---
+# --- 2. 데이터 스키마 정의 (명세서 18.2 & 18.4) ---
 
 class PolicySupport(BaseModel):
     policy_id: str = Field(..., description="정책 고유 번호", example="POL-2026-001")
@@ -51,7 +51,22 @@ class EligibilityResult(BaseModel):
     status: EligibilityStatus
     reasons: List[str] = Field(..., description="판정 사유 상세 목록")
 
-# --- 3. Mock 정책 데이터 (명세서 규격 적용) ---
+# [명세서 18.4] 지원 효과 시뮬레이션 요청/응답 스키마
+class SimulationRequest(BaseModel):
+    policy_id: str = Field(..., description="적용하고자 하는 정책 ID", example="POL-2026-001")
+    current_loan_amount_krw: int = Field(..., description="기존 대출 잔액(원)", example=30000000)
+    current_interest_rate_pct: float = Field(..., description="기존 대출 금리(%)", example=7.5)
+    policy_interest_rate_pct: float = Field(default=2.0, description="정책 지원 적용 우대 금리(%)", example=2.0)
+
+class SimulationResult(BaseModel):
+    policy_id: str
+    current_annual_interest_krw: int = Field(..., description="기존 연간 이자 비용(원)")
+    new_annual_interest_krw: int = Field(..., description="정책 적용 후 연간 이자 비용(원)")
+    annual_savings_krw: int = Field(..., description="연간 절감액(원)")
+    monthly_savings_krw: int = Field(..., description="월 절감액(원)")
+    summary_message: str = Field(..., description="결과 요약 설명 문구")
+
+# --- 3. Mock 정책 데이터 ---
 
 MOCK_POLICIES: List[dict] = [
     {
@@ -73,7 +88,7 @@ MOCK_POLICIES: List[dict] = [
         "name": "서울특별시 영세 소상공인 임대료 특별지원",
         "provider": "서울특별시",
         "purpose": [PolicyPurpose.RENT_SUPPORT],
-        "region_codes": ["11"],  # 서울 전용
+        "region_codes": ["11"],
         "industry_inclusions": ["FNB", "RETAIL"],
         "industry_exclusions": ["GAMBLING"],
         "max_amount_krw": 2000000,
@@ -95,9 +110,6 @@ def get_policies(
     industry: Optional[str] = Query(None, description="업종 코드 (예: FNB)"),
     region: Optional[str] = Query(None, description="지역 코드 (예: 11=서울)")
 ):
-    """
-    AI 및 결정형 시스템이 정책 지원금 전체 목록을 검색/조회합니다.
-    """
     results = MOCK_POLICIES
     if industry:
         results = [p for p in results if industry.upper() in p["industry_inclusions"]]
@@ -107,9 +119,6 @@ def get_policies(
 
 @app.post("/api/v1/policies/evaluate", response_model=List[EligibilityResult])
 def evaluate_policy_eligibility(store: StoreProfileRequest):
-    """
-    [명세서 18.3] 점포 프로파일을 입력받아 정책별 적격성을 선언적 규칙 기반으로 결정론적으로 판정합니다.
-    """
     today = date.today()
     evaluations = []
 
@@ -117,7 +126,6 @@ def evaluate_policy_eligibility(store: StoreProfileRequest):
         reasons = []
         is_eligible = True
 
-        # 규칙 1. 마감 여부 점검
         end_date = date.fromisoformat(policy["application_end"])
         if today > end_date:
             evaluations.append(EligibilityResult(
@@ -128,17 +136,14 @@ def evaluate_policy_eligibility(store: StoreProfileRequest):
             ))
             continue
 
-        # 규칙 2. 지역 일치 여부 점검
         if "ALL" not in policy["region_codes"] and store.region_code not in policy["region_codes"]:
             is_eligible = False
             reasons.append(f"지역 불일치 (점포: {store.region_code}, 지원지역: {policy['region_codes']})")
 
-        # 규칙 3. 제외 업종 점검
         if store.industry_code in policy["industry_exclusions"]:
             is_eligible = False
             reasons.append(f"지원 제외 업종 해당 ({store.industry_code})")
 
-        # 규칙 4. 포함 업종 점검
         if "ALL" not in policy["industry_inclusions"] and store.industry_code not in policy["industry_inclusions"]:
             is_eligible = False
             reasons.append(f"지원 대상 업종 미포함 (점포: {store.industry_code})")
@@ -155,3 +160,22 @@ def evaluate_policy_eligibility(store: StoreProfileRequest):
         ))
 
     return evaluations
+
+@app.post("/api/v1/policies/simulate-benefit", response_model=SimulationResult)
+def simulate_policy_benefit(req: SimulationRequest):
+    """
+    [명세서 18.4] 정책 적용 시 기존 대출 대비 금융비용 절감액을 수치적으로 시뮬레이션합니다.
+    """
+    current_annual_interest = int(req.current_loan_amount_krw * (req.current_interest_rate_pct / 100))
+    new_annual_interest = int(req.current_loan_amount_krw * (req.policy_interest_rate_pct / 100))
+    annual_savings = current_annual_interest - new_annual_interest
+    monthly_savings = int(annual_savings / 12)
+
+    return SimulationResult(
+        policy_id=req.policy_id,
+        current_annual_interest_krw=current_annual_interest,
+        new_annual_interest_krw=new_annual_interest,
+        annual_savings_krw=annual_savings,
+        monthly_savings_krw=monthly_savings,
+        summary_message=f"정책 적용 시 연간 약 {annual_savings:,}원(월 약 {monthly_savings:,}원)의 이자 비용이 절감됩니다."
+    )
